@@ -1,4 +1,32 @@
+# Python virtual environment
 venv/
-.env
+env/
+ENV/
+.venv/
+
+# Byte-compiled / optimized files
 __pycache__/
-*.pyc
+*.py[cod]
+*$py.class
+
+# Environment variables
+.env
+.env.local
+
+# Cache and temporary data
+data/cache/
+data/*.db
+data/*.sqlite3
+models/cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+.vscode/
+.idea/
