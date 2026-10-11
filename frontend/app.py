@@ -58,14 +58,17 @@ def main():
 
         for eq in example_queries:
             if st.button(f"📌 {eq}", key=f"btn_{eq}", use_container_width=True):
-                st.session_state["query_input"] = eq
+                st.session_state["search_box"] = eq
+                st.session_state["auto_search"] = True
+                st.rerun()
 
     # Main search input
-    default_query = st.session_state.get("query_input", "")
+    if "search_box" not in st.session_state:
+        st.session_state["search_box"] = ""
+
     query = st.text_input(
         "Enter your question or lecture concept:",
-        value=default_query,
-        placeholder="e.g. How does gradient descent update neural network weights?",
+        placeholder="e.g. Binary search algorithm or Photosynthesis in plants",
         key="search_box"
     )
 
@@ -75,8 +78,12 @@ def main():
     with col_count:
         top_k = st.selectbox("Top Results", options=[3, 6, 8], index=1, label_visibility="collapsed")
 
+    # Check if auto_search was triggered by a sidebar button
+    auto_trigger = st.session_state.pop("auto_search", False)
+    do_search = search_clicked or auto_trigger
+
     # Search execution
-    if search_clicked:
+    if do_search:
         if not query.strip():
             st.warning("Please type a question or select one of the sample questions above.")
         else:

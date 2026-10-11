@@ -103,75 +103,140 @@ class YouTubeClient:
         cleaned_query = query.strip()
         limit = max(1, min(max_results, MAX_CANDIDATE_VIDEOS))
 
-        # Check if API client is initialized
-        if not self._service or not self.api_key:
-            logger.info("YouTube API key not configured. Using curated educational candidates.")
-            if allow_fallback:
-                return self._get_filtered_fallback(cleaned_query, limit)
-            raise YouTubeRetrievalError("YouTube API key is missing or not configured.")
-
+    def _search_with_ytdlp(self, query: str, limit: int) -> List[Dict[str, Any]]:
+        """
+        Perform a live YouTube search using yt-dlp.
+        Allows searching YouTube for any user topic without requiring an API key.
+        """
         try:
-            # Append educational context hint if needed to prioritize high quality lectures
-            search_request = self._service.search().list(
-                q=f"{cleaned_query} lecture tutorial explanation",
-                part="snippet",
-                type="video",
-                maxResults=limit,
-                videoEmbeddable="true",
-                safeSearch="moderate",
-                relevanceLanguage="en"
-            )
-            response = search_request.execute()
+            import yt_dlp
+            logger.info(f"Performing live YouTube search via yt-dlp for: '{query}'")
+            ydl_opts = {
+                "quiet": True,
+                "extract_flat": True,
+                "skip_download": True,
+                "no_warnings": True,
+            }
+            # Search YouTube with educational context
+            search_query = f"ytsearch{limit}:{query} lecture tutorial"
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(search_query, download=False)
+                entries = info.get("entries", [])
+                videos: List[Dict[str, Any]] = []
 
-            items = response.get("items", [])
-            videos: List[Dict[str, Any]] = []
+                for entry in entries:
+                    if not entry:
+                        continue
+                    video_id = entry.get("id")
+                    if not video_id:
+                        continue
 
-            for item in items:
-                id_info = item.get("id", {})
-                video_id = id_info.get("videoId")
-                if not video_id:
-                    continue
+                    # Determine thumbnail
+                    thumb_url = f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+                    if entry.get("thumbnails"):
+                        thumb_url = entry["thumbnails"][-1].get("url", thumb_url)
 
-                snippet = item.get("snippet", {})
-                thumbnails = snippet.get("thumbnails", {})
-                # Pick highest available thumbnail
-                thumb_url = (
-                    thumbnails.get("high", {}).get("url")
-                    or thumbnails.get("medium", {}).get("url")
-                    or thumbnails.get("default", {}).get("url")
-                    or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
-                )
+                    videos.append({
+                        "video_id": video_id,
+                        "title": entry.get("title", ""),
+                        "description": entry.get("description", "") or "",
+                        "channel_name": entry.get("uploader") or entry.get("channel") or "YouTube",
+                        "published_at": str(entry.get("upload_date", "")),
+                        "thumbnail_url": thumb_url
+                    })
 
-                videos.append({
-                    "video_id": video_id,
-                    "title": snippet.get("title", ""),
-                    "description": snippet.get("description", ""),
-                    "channel_name": snippet.get("channelTitle", ""),
-                    "published_at": snippet.get("publishedAt", ""),
-                    "thumbnail_url": thumb_url
-                })
-
-            if not videos and allow_fallback:
-                logger.info("YouTube search returned 0 items; falling back to curated candidates.")
-                return self._get_filtered_fallback(cleaned_query, limit)
-
-            return videos[:limit]
-
-        except HttpError as http_err:
-            status_code = http_err.resp.status if hasattr(http_err, "resp") else None
-            reason = getattr(http_err, "_get_reason", lambda: str(http_err))()
-            logger.error(f"YouTube Data API HTTP error ({status_code}): {reason}")
-
-            if allow_fallback:
-                logger.info("Falling back to curated educational candidates due to API HTTP error.")
-                return self._get_filtered_fallback(cleaned_query, limit)
-            raise YouTubeRetrievalError(f"YouTube API error: {reason}") from http_err
+                logger.info(f"yt-dlp found {len(videos)} live YouTube videos.")
+                return videos[:limit]
 
         except Exception as e:
-            logger.error(f"Unexpected error while querying YouTube API: {e}")
-            if allow_fallback:
-                return self._get_filtered_fallback(cleaned_query, limit)
-            raise YouTubeRetrievalError(f"Failed to retrieve videos: {e}") from e
+            logger.warning(f"yt-dlp live search failed for '{query}': {e}")
+            return []
+
+    def search_videos(
+        self,
+        query: str,
+        max_results: int = MAX_CANDIDATE_VIDEOS,
+        allow_fallback: bool = True
+    ) -> List[Dict[str, Any]]:
+        """
+        Search YouTube for educational videos matching the student's query.
+        Tries YouTube Data API v3 first; if not configured or quota exceeded,
+        performs live search via yt-dlp.
+
+        Args:
+            query: Natural language query.
+            max_results: Maximum candidate videos to retrieve (up to 6).
+            allow_fallback: If True, returns curated fallback videos when all network searches fail.
+
+        Returns:
+            List of video metadata dictionaries.
+        """
+        if not query or not query.strip():
+            logger.warning("Empty search query provided to YouTubeClient.")
+            return []
+
+        cleaned_query = query.strip()
+        limit = max(1, min(max_results, MAX_CANDIDATE_VIDEOS))
+
+        # 1. Attempt YouTube Data API v3 if key is present
+        if self._service and self.api_key:
+            try:
+                search_request = self._service.search().list(
+                    q=f"{cleaned_query} lecture tutorial explanation",
+                    part="snippet",
+                    type="video",
+                    maxResults=limit,
+                    videoEmbeddable="true",
+                    safeSearch="moderate",
+                    relevanceLanguage="en"
+                )
+                response = search_request.execute()
+
+                items = response.get("items", [])
+                videos: List[Dict[str, Any]] = []
+
+                for item in items:
+                    id_info = item.get("id", {})
+                    video_id = id_info.get("videoId")
+                    if not video_id:
+                        continue
+
+                    snippet = item.get("snippet", {})
+                    thumbnails = snippet.get("thumbnails", {})
+                    thumb_url = (
+                        thumbnails.get("high", {}).get("url")
+                        or thumbnails.get("medium", {}).get("url")
+                        or thumbnails.get("default", {}).get("url")
+                        or f"https://img.youtube.com/vi/{video_id}/hqdefault.jpg"
+                    )
+
+                    videos.append({
+                        "video_id": video_id,
+                        "title": snippet.get("title", ""),
+                        "description": snippet.get("description", ""),
+                        "channel_name": snippet.get("channelTitle", ""),
+                        "published_at": snippet.get("publishedAt", ""),
+                        "thumbnail_url": thumb_url
+                    })
+
+                if videos:
+                    logger.info(f"Retrieved {len(videos)} videos via YouTube Data API v3.")
+                    return videos[:limit]
+
+            except Exception as e:
+                logger.warning(f"YouTube Data API error: {e}. Switching to live yt-dlp search.")
+
+        # 2. Live YouTube Search via yt-dlp (works for ANY query without an API key)
+        live_videos = self._search_with_ytdlp(cleaned_query, limit)
+        if live_videos:
+            return live_videos
+
+        # 3. Offline Curated Fallback (if network/search fails completely)
+        if allow_fallback:
+            logger.info("Falling back to curated educational candidates.")
+            return self._get_filtered_fallback(cleaned_query, limit)
+
+        raise YouTubeRetrievalError(f"No videos could be retrieved for query: '{cleaned_query}'.")
 
     def _get_filtered_fallback(self, query: str, limit: int) -> List[Dict[str, Any]]:
         """Filter curated fallback videos based on query terms or return top subset."""
