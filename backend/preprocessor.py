@@ -93,23 +93,22 @@ class TranscriptChunker:
         if not valid_segments:
             return []
 
-        # Break into words with word-level timing estimates
+        # Associate words with their source caption interval; do not infer word timings.
         timed_words = []
         for seg in valid_segments:
             words = seg["text"].split()
-            if not words:
+            if not words or seg["end"] <= seg["start"]:
+                if words:
+                    logger.warning(
+                        "Skipping transcript segment with invalid timing for video %s.",
+                        video_id,
+                    )
                 continue
-            seg_start = seg["start"]
-            seg_end = max(seg["end"], seg_start + 0.1)
-            time_per_word = (seg_end - seg_start) / len(words)
-
-            for i, w in enumerate(words):
-                w_start = seg_start + (i * time_per_word)
-                w_end = w_start + time_per_word
+            for word in words:
                 timed_words.append({
-                    "word": w,
-                    "start": w_start,
-                    "end": w_end
+                    "word": word,
+                    "start": seg["start"],
+                    "end": seg["end"]
                 })
 
         if not timed_words:
@@ -134,7 +133,11 @@ class TranscriptChunker:
             chunk_start = round(window[0]["start"], 2)
             chunk_end = round(window[-1]["end"], 2)
             if chunk_end <= chunk_start:
-                chunk_end = round(chunk_start + 1.0, 2)
+                logger.warning(
+                    "Skipping chunk with invalid source timing for video %s.",
+                    video_id,
+                )
+                continue
 
             chunk_id = f"{video_id}_chunk_{chunk_idx:04d}"
             chunks.append({

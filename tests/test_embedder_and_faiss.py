@@ -2,7 +2,32 @@
 
 import pytest
 import numpy as np
+from backend.config import EMBEDDING_BATCH_SIZE
+from backend.embedder import Embedder
 from backend.vector_store import FAISSIndex
+
+
+def test_embedder_uses_configured_batch_size_and_normalization():
+    class RecordingModel:
+        def get_sentence_embedding_dimension(self):
+            return 2
+
+        def encode(self, sentences, **kwargs):
+            self.sentences = sentences
+            self.kwargs = kwargs
+            return np.tile(np.array([[0.6, 0.8]], dtype=np.float32), (len(sentences), 1))
+
+    model = RecordingModel()
+    embedder = Embedder()
+    embedder._model = model
+
+    vectors = embedder.encode_texts(["first chunk", "second chunk"])
+
+    assert vectors.shape == (2, 2)
+    assert model.sentences == ["first chunk", "second chunk"]
+    assert model.kwargs["batch_size"] == EMBEDDING_BATCH_SIZE
+    assert model.kwargs["normalize_embeddings"] is True
+    np.testing.assert_allclose(np.linalg.norm(vectors, axis=1), 1.0)
 
 
 def test_faiss_index_basic_operations():

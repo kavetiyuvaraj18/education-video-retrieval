@@ -3,9 +3,14 @@
 import hashlib
 import logging
 import math
+import threading
 from typing import List, Optional
 import numpy as np
-from backend.config import EMBEDDING_MODEL_NAME
+from backend.config import (
+    EMBEDDING_BATCH_SIZE,
+    EMBEDDING_CPU_THREADS,
+    EMBEDDING_MODEL_NAME,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -14,6 +19,8 @@ DEFAULT_EMBEDDING_DIM = 384
 
 # Global cache for the loaded model or fallback
 _CACHED_EMBEDDER_INSTANCE = None
+_CACHED_EMBEDDER_MODELS = {}
+_CACHED_EMBEDDER_LOCK = threading.Lock()
 
 
 class SemanticFallbackEmbedder:
@@ -83,22 +90,40 @@ def get_cached_embedder_model(model_name: str = EMBEDDING_MODEL_NAME):
     back to SemanticFallbackEmbedder to ensure reliable service.
     """
     global _CACHED_EMBEDDER_INSTANCE
-    if _CACHED_EMBEDDER_INSTANCE is not None:
-        return _CACHED_EMBEDDER_INSTANCE
+    if model_name in _CACHED_EMBEDDER_MODELS:
+        return _CACHED_EMBEDDER_MODELS[model_name]
 
-    try:
-        from sentence_transformers import SentenceTransformer
-        logger.info(f"Loading Hugging Face Sentence Transformers model '{model_name}'...")
-        _CACHED_EMBEDDER_INSTANCE = SentenceTransformer(model_name)
-        logger.info(f"Successfully loaded '{model_name}'.")
-        return _CACHED_EMBEDDER_INSTANCE
-    except Exception as e:
-        logger.warning(
-            f"SentenceTransformer could not be initialized ({e}). "
-            f"Activating resilient 384-dim semantic embedding fallback."
-        )
-        _CACHED_EMBEDDER_INSTANCE = SemanticFallbackEmbedder(dimension=DEFAULT_EMBEDDING_DIM)
-        return _CACHED_EMBEDDER_INSTANCE
+    with _CACHED_EMBEDDER_LOCK:
+        if model_name in _CACHED_EMBEDDER_MODELS:
+            return _CACHED_EMBEDDER_MODELS[model_name]
+        try:
+            import torch
+            try:
+                torch.set_num_threads(EMBEDDING_CPU_THREADS)
+                logger.info(
+                    "Configured PyTorch CPU embedding threads: %d.",
+                    EMBEDDING_CPU_THREADS,
+                )
+            except RuntimeError:
+                logger.warning(
+                    "Could not configure PyTorch CPU threads to %d; retaining the current setting.",
+                    EMBEDDING_CPU_THREADS,
+                    exc_info=True,
+                )
+            from sentence_transformers import SentenceTransformer
+            logger.info(f"Loading Hugging Face Sentence Transformers model '{model_name}'...")
+            model = SentenceTransformer(model_name)
+            logger.info(f"Successfully loaded '{model_name}'.")
+        except Exception as e:
+            logger.warning(
+                f"SentenceTransformer could not be initialized ({e}). "
+                f"Activating resilient 384-dim semantic embedding fallback."
+            )
+            model = SemanticFallbackEmbedder(dimension=DEFAULT_EMBEDDING_DIM)
+        _CACHED_EMBEDDER_MODELS[model_name] = model
+        if model_name == EMBEDDING_MODEL_NAME:
+            _CACHED_EMBEDDER_INSTANCE = model
+        return model
 
 
 class Embedder:
@@ -107,6 +132,7 @@ class Embedder:
     def __init__(self, model_name: Optional[str] = None):
         self.model_name = model_name or EMBEDDING_MODEL_NAME
         self._model = None
+        self._encode_lock = threading.Lock()
 
     @property
     def model(self):
@@ -114,10 +140,27 @@ class Embedder:
             self._model = get_cached_embedder_model(self.model_name)
         return self._model
 
+    @property
+    def cache_identity(self) -> str:
+        """Stable cache identity for embeddings produced by this model."""
+        model = self.model
+        revisions = []
+        if hasattr(model, "modules"):
+            for module in model.modules():
+                config = getattr(getattr(module, "auto_model", None), "config", None)
+                revision = getattr(config, "_commit_hash", None)
+                if revision:
+                    revisions.append(str(revision))
+        revision_identity = ",".join(sorted(set(revisions))) or "unversioned"
+        return (
+            f"{self.model_name}|{type(model).__module__}.{type(model).__qualname__}"
+            f"|{revision_identity}|{self.get_dimension()}|normalized-v1"
+        )
+
     def encode_texts(
         self,
         texts: List[str],
-        batch_size: int = 32,
+        batch_size: int = EMBEDDING_BATCH_SIZE,
         normalize: bool = True
     ) -> np.ndarray:
         """
@@ -129,13 +172,14 @@ class Embedder:
 
         cleaned_texts = [str(t).strip() if str(t).strip() else "lecture content" for t in texts]
 
-        embeddings = self.model.encode(
-            cleaned_texts,
-            batch_size=batch_size,
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=normalize
-        )
+        with self._encode_lock:
+            embeddings = self.model.encode(
+                cleaned_texts,
+                batch_size=batch_size,
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=normalize
+            )
         return np.asarray(embeddings, dtype=np.float32)
 
     def encode_query(self, query: str, normalize: bool = True) -> np.ndarray:
@@ -144,12 +188,13 @@ class Embedder:
         """
         cleaned_query = str(query).strip() if query else "educational lecture"
 
-        emb = self.model.encode(
-            [cleaned_query],
-            show_progress_bar=False,
-            convert_to_numpy=True,
-            normalize_embeddings=normalize
-        )
+        with self._encode_lock:
+            emb = self.model.encode(
+                [cleaned_query],
+                show_progress_bar=False,
+                convert_to_numpy=True,
+                normalize_embeddings=normalize
+            )
         return np.asarray(emb, dtype=np.float32)
 
     def get_dimension(self) -> int:

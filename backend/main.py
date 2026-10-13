@@ -1,8 +1,11 @@
 """FastAPI REST API for Educational Video Retrieval."""
 
+import asyncio
 import logging
+import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, status
+from fastapi import FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -35,8 +38,26 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+@app.middleware("http")
+async def log_search_response_timing(request: Request, call_next):
+    """Record end-to-end API time, including response validation and serialization."""
+    start = time.perf_counter()
+    response = await call_next(request)
+    if request.url.path == "/search":
+        logger.info(
+            "Search HTTP response completed with status=%d in %.3fs.",
+            response.status_code,
+            time.perf_counter() - start,
+        )
+    return response
+
+
 # Lazy pipeline singleton
 _pipeline: Optional[VideoRetrievalPipeline] = None
+
+# Thread pool for blocking pipeline work (keeps async event loop free)
+_executor = ThreadPoolExecutor(max_workers=3)
 
 
 def get_pipeline() -> VideoRetrievalPipeline:
@@ -51,7 +72,7 @@ def get_pipeline() -> VideoRetrievalPipeline:
 class SearchRequest(BaseModel):
     query: str = Field(..., min_length=1, max_length=500, description="Student conceptual question")
     top_k: int = Field(default=DEFAULT_TOP_K, ge=1, le=10, description="Number of videos to return")
-    candidate_limit: int = Field(default=MAX_CANDIDATE_VIDEOS, ge=1, le=12, description="Candidate search limit")
+    candidate_limit: int = Field(default=MAX_CANDIDATE_VIDEOS, ge=1, le=15, description="Candidate search limit")
 
 
 class VideoResultItem(BaseModel):
@@ -88,7 +109,7 @@ class HealthResponse(BaseModel):
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check endpoint."""
+    """Health check endpoint — always fast, never blocks."""
     return {
         "status": "healthy",
         "embedding_model": EMBEDDING_MODEL_NAME,
@@ -100,6 +121,7 @@ async def health_check():
 async def search_videos(request: SearchRequest):
     """
     Search educational videos and retrieve timestamped lecture portions.
+    Runs blocking pipeline work in a thread pool to keep the event loop free.
     """
     query = request.query.strip()
     if not query:
@@ -110,10 +132,16 @@ async def search_videos(request: SearchRequest):
 
     try:
         pipeline = get_pipeline()
-        pipeline_output = pipeline.process_query(
-            query=query,
-            top_k=request.top_k,
-            candidate_limit=request.candidate_limit
+        loop = asyncio.get_event_loop()
+
+        # Run all blocking I/O (yt-dlp, HTTP fetches, numpy) off the event loop
+        pipeline_output = await loop.run_in_executor(
+            _executor,
+            lambda: pipeline.process_query(
+                query=query,
+                top_k=request.top_k,
+                candidate_limit=request.candidate_limit,
+            )
         )
 
         return pipeline_output

@@ -16,7 +16,8 @@ class VideoRanker:
     def rank_videos(
         self,
         retrieved_chunks: List[Dict[str, Any]],
-        candidate_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None
+        candidate_metadata_map: Optional[Dict[str, Dict[str, Any]]] = None,
+        top_k: Optional[int] = None
     ) -> List[Dict[str, Any]]:
         """
         Rank videos based on retrieved transcript chunks.
@@ -89,7 +90,7 @@ class VideoRanker:
             }
             ranked_videos.append(video_result)
 
-        # Sort videos descending by relevance_score
+        # Sort videos descending by relevance_score, then return only available top results.
         ranked_videos.sort(key=lambda v: v["relevance_score"], reverse=True)
 
-        return ranked_videos[:self.top_k]
+        return ranked_videos[:self.top_k if top_k is None else top_k]

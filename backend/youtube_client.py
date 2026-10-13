@@ -1,7 +1,10 @@
 """YouTube Data API v3 Client for Educational Video Retrieval."""
 
 import logging
+import threading
+import time
 from typing import List, Dict, Any, Optional
+import httplib2
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 from backend.config import YOUTUBE_API_KEY, MAX_CANDIDATE_VIDEOS
@@ -72,36 +75,20 @@ class YouTubeClient:
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key if api_key is not None else YOUTUBE_API_KEY
         self._service = None
+        self._search_cache: Dict[str, tuple[float, float, List[Dict[str, Any]]]] = {}
+        self._search_cache_lock = threading.Lock()
         if self.api_key:
             try:
-                self._service = build("youtube", "v3", developerKey=self.api_key)
+                self._service = build(
+                    "youtube",
+                    "v3",
+                    developerKey=self.api_key,
+                    http=httplib2.Http(timeout=10),
+                    cache_discovery=False,
+                )
             except Exception as e:
                 logger.warning(f"Could not build YouTube API service with provided key: {e}")
                 self._service = None
-
-    def search_videos(
-        self,
-        query: str,
-        max_results: int = MAX_CANDIDATE_VIDEOS,
-        allow_fallback: bool = True
-    ) -> List[Dict[str, Any]]:
-        """
-        Search YouTube for educational videos matching the student's query.
-
-        Args:
-            query: Natural language query.
-            max_results: Maximum candidate videos to retrieve (up to 6).
-            allow_fallback: If True, returns curated fallback videos when API is unavailable.
-
-        Returns:
-            List of video metadata dictionaries.
-        """
-        if not query or not query.strip():
-            logger.warning("Empty search query provided to YouTubeClient.")
-            return []
-
-        cleaned_query = query.strip()
-        limit = max(1, min(max_results, MAX_CANDIDATE_VIDEOS))
 
     def _search_with_ytdlp(self, query: str, limit: int) -> List[Dict[str, Any]]:
         """
@@ -116,6 +103,9 @@ class YouTubeClient:
                 "extract_flat": True,
                 "skip_download": True,
                 "no_warnings": True,
+                "socket_timeout": 10,
+                "retries": 1,
+                "extractor_retries": 1,
             }
             # Search YouTube with educational context
             search_query = f"ytsearch{limit}:{query} lecture tutorial"
@@ -177,6 +167,17 @@ class YouTubeClient:
 
         cleaned_query = query.strip()
         limit = max(1, min(max_results, MAX_CANDIDATE_VIDEOS))
+        cache_key = f"{cleaned_query.casefold()}|{limit}|fallback={allow_fallback}"
+        with self._search_cache_lock:
+            cached = self._search_cache.get(cache_key)
+            if cached:
+                cached_at, ttl, cached_videos = cached
+                if time.monotonic() - cached_at < ttl:
+                    logger.info("Using cached YouTube candidates for query (%d videos).", len(cached_videos))
+                    return [dict(video) for video in cached_videos]
+                self._search_cache.pop(cache_key, None)
+
+        cache_ttl = 300.0
 
         # 1. Attempt YouTube Data API v3 if key is present
         if self._service and self.api_key:
@@ -221,7 +222,7 @@ class YouTubeClient:
 
                 if videos:
                     logger.info(f"Retrieved {len(videos)} videos via YouTube Data API v3.")
-                    return videos[:limit]
+                    return self._cache_search_results(cache_key, videos[:limit], cache_ttl)
 
             except Exception as e:
                 logger.warning(f"YouTube Data API error: {e}. Switching to live yt-dlp search.")
@@ -229,14 +230,38 @@ class YouTubeClient:
         # 2. Live YouTube Search via yt-dlp (works for ANY query without an API key)
         live_videos = self._search_with_ytdlp(cleaned_query, limit)
         if live_videos:
-            return live_videos
+            return self._cache_search_results(cache_key, live_videos, cache_ttl)
 
         # 3. Offline Curated Fallback (if network/search fails completely)
         if allow_fallback:
             logger.info("Falling back to curated educational candidates.")
-            return self._get_filtered_fallback(cleaned_query, limit)
+            return self._cache_search_results(
+                cache_key,
+                self._get_filtered_fallback(cleaned_query, limit),
+                30.0,
+            )
 
         raise YouTubeRetrievalError(f"No videos could be retrieved for query: '{cleaned_query}'.")
+
+    def _cache_search_results(
+        self,
+        cache_key: str,
+        videos: List[Dict[str, Any]],
+        ttl_seconds: float,
+    ) -> List[Dict[str, Any]]:
+        with self._search_cache_lock:
+            self._search_cache[cache_key] = (
+                time.monotonic(),
+                ttl_seconds,
+                [dict(video) for video in videos],
+            )
+            if len(self._search_cache) > 128:
+                oldest_key = min(
+                    self._search_cache,
+                    key=lambda key: self._search_cache[key][0],
+                )
+                self._search_cache.pop(oldest_key, None)
+        return videos
 
     def _get_filtered_fallback(self, query: str, limit: int) -> List[Dict[str, Any]]:
         """Filter curated fallback videos based on query terms or return top subset."""

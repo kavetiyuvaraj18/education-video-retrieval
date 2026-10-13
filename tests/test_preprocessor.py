@@ -45,3 +45,17 @@ def test_format_timestamp():
     assert TranscriptChunker.format_timestamp(45) == "00:45"
     assert TranscriptChunker.format_timestamp(125) == "02:05"
     assert TranscriptChunker.format_timestamp(3665) == "01:01:05"
+
+
+def test_chunk_timestamps_preserve_caption_segment_boundaries():
+    chunker = TranscriptChunker(chunk_size=10, chunk_overlap=0)
+    chunks = chunker.create_chunks(
+        "timed_video",
+        [
+            {"text": "A caption with several words", "start": 12.25, "duration": 3.5},
+            {"text": "another caption interval", "start": 20.0, "duration": 2.0},
+        ],
+    )
+
+    assert chunks[0]["start_time"] == 12.25
+    assert chunks[0]["end_time"] == 22.0

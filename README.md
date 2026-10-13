@@ -138,3 +138,12 @@ streamlit run frontend/app.py
 - **Quota Exceeded / Missing API Key:** Automatically provides curated educational candidates so students can continue exploring topics offline.
 - **Missing Captions:** Gracefully falls back to speech recognition or skips unavailable videos without crashing the remaining candidate pipeline.
 - **Duplicate Portions:** Chunks from the same video are aggregated with a discounted secondary factor to prevent duplicate chunks from boosting one video unfairly.
+
+## Search Caching and Timing
+- Successful transcripts are reused from `data/cache/transcripts`; unavailable transcript lookups are cached for 15 minutes before retrying.
+- Transcript chunk data and normalized embeddings are persisted under `data/cache/processed`. Cache keys include transcript contents, chunking settings, and the embedding model identity/revision so stale features are not reused.
+- CPU embedding uses a configurable batch size (`EMBEDDING_BATCH_SIZE`, default 32) and PyTorch thread count (`EMBEDDING_CPU_THREADS`, default up to 12 logical CPUs). Larger batches are not always faster and use more memory.
+- Candidate searches are cached in memory briefly (five minutes for live results and 30 seconds for curated fallback results). FAISS indexes are reused in memory for matching recent corpora.
+- Independent transcript lookups run with bounded concurrency. Whisper remains a fallback after caption retrieval and is limited to two candidates per search to bound audio download/transcription work; the remaining candidates use captions or are skipped if captions are unavailable.
+- Chunk boundaries use source caption/Whisper segment intervals rather than estimated word-level times. Timestamp precision is limited by the granularity of the source transcript.
+- Backend logs include candidate search, transcript/cache, embedding, FAISS, ranking, timestamp enrichment, and end-to-end response timings.

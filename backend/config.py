@@ -16,6 +16,11 @@ YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
 # Hugging Face & Sentence Transformers
 EMBEDDING_MODEL_NAME = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+EMBEDDING_BATCH_SIZE = max(1, int(os.getenv("EMBEDDING_BATCH_SIZE", "32")))
+EMBEDDING_CPU_THREADS = max(
+    1,
+    int(os.getenv("EMBEDDING_CPU_THREADS", str(min(os.cpu_count() or 1, 12)))),
+)
 
 # OpenAI Whisper configuration
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "tiny")
@@ -31,8 +36,9 @@ SQLITE_DB_PATH = BASE_DIR / os.getenv("SQLITE_DB_PATH", "data/video_retrieval.db
 ENABLE_SQLITE_CACHE = os.getenv("ENABLE_SQLITE_CACHE", "true").lower() in ("true", "1", "yes")
 
 # Retrieval & Chunking Hyperparameters
-MAX_CANDIDATE_VIDEOS = 6
+MAX_CANDIDATE_VIDEOS = 10
 DEFAULT_TOP_K = 6
+MIN_CHUNKS_PER_VIDEO = 3
 CHUNK_WORD_SIZE = 60
 CHUNK_OVERLAP_WORDS = 15
 SIMILARITY_METRIC = "cosine"  # Inner product with L2-normalized embeddings

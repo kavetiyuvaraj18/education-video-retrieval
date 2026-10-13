@@ -5,6 +5,8 @@ import logging
 import os
 import shutil
 import tempfile
+import threading
+import time
 from pathlib import Path
 from typing import List, Dict, Any, Optional
 
@@ -25,28 +27,38 @@ logger = logging.getLogger(__name__)
 
 # Cache for loaded Whisper model instance
 _WHISPER_MODEL = None
+_WHISPER_MODEL_LOCK = threading.Lock()
+_WHISPER_TRANSCRIPTION_LOCK = threading.Lock()
 
 
 def get_cached_whisper_model(model_size: str = WHISPER_MODEL_SIZE):
     """Load and cache the Whisper model in memory."""
     global _WHISPER_MODEL
     if _WHISPER_MODEL is None:
-        try:
-            import whisper
-            logger.info(f"Loading Whisper model '{model_size}'...")
-            _WHISPER_MODEL = whisper.load_model(model_size)
-        except Exception as e:
-            logger.warning(f"Could not load Whisper model: {e}")
-            _WHISPER_MODEL = None
+        with _WHISPER_MODEL_LOCK:
+            if _WHISPER_MODEL is None:
+                try:
+                    import whisper
+                    logger.info(f"Loading Whisper model '{model_size}'...")
+                    _WHISPER_MODEL = whisper.load_model(model_size)
+                except Exception as e:
+                    logger.warning(f"Could not load Whisper model: {e}")
+                    _WHISPER_MODEL = None
     return _WHISPER_MODEL
 
 
 class TranscriptExtractor:
     """Extracts timestamped transcript segments from YouTube videos."""
 
-    def __init__(self, cache_dir: Optional[Path] = None, enable_cache: bool = True):
+    def __init__(
+        self,
+        cache_dir: Optional[Path] = None,
+        enable_cache: bool = True,
+        failed_cache_ttl_seconds: int = 900,
+    ):
         self.cache_dir = cache_dir or (CACHE_DIR / "transcripts")
         self.enable_cache = enable_cache
+        self.failed_cache_ttl_seconds = max(0, failed_cache_ttl_seconds)
         if self.enable_cache:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
 
@@ -70,27 +82,72 @@ class TranscriptExtractor:
             return []
 
         # 1. Check local cache
+        cache_start = time.perf_counter()
         cached = self._read_cache(video_id)
+        logger.info(
+            "Transcript cache lookup for %s completed in %.3fs (%s).",
+            video_id,
+            time.perf_counter() - cache_start,
+            "hit" if cached else "miss",
+        )
         if cached is not None:
             logger.info(f"Using cached transcript for video {video_id} ({len(cached)} segments).")
             return cached
 
+        failure_cache_start = time.perf_counter()
+        failed_cache = self._read_failure_cache(video_id)
+        logger.info(
+            "Failed-transcript cache lookup for %s completed in %.3fs (%s).",
+            video_id,
+            time.perf_counter() - failure_cache_start,
+            "hit" if failed_cache else "miss",
+        )
+        if failed_cache and (
+            not allow_whisper_fallback or failed_cache.get("whisper_attempted", False)
+        ):
+            logger.info("Using recent failed transcript lookup for video %s.", video_id)
+            return []
+
         # 2. Try YouTube Captions
-        segments = self._fetch_youtube_captions(video_id)
+        if failed_cache and allow_whisper_fallback:
+            segments = []
+            logger.info(
+                "Skipping repeated caption lookup for %s before Whisper fallback.",
+                video_id,
+            )
+        else:
+            caption_start = time.perf_counter()
+            segments = self._fetch_youtube_captions(video_id)
+            logger.info(
+                "Caption retrieval for %s completed in %.3fs (%d segments).",
+                video_id,
+                time.perf_counter() - caption_start,
+                len(segments),
+            )
         if segments:
             logger.info(f"Retrieved {len(segments)} caption segments for video {video_id}.")
             self._write_cache(video_id, segments)
+            self._clear_failure_cache(video_id)
             return segments
 
         # 3. Whisper Audio Fallback
         if allow_whisper_fallback:
             logger.info(f"Captions unavailable for {video_id}. Attempting Whisper transcription fallback...")
+            whisper_start = time.perf_counter()
             segments = self._transcribe_with_whisper(video_id)
+            logger.info(
+                "Whisper fallback for %s completed in %.3fs (%d segments).",
+                video_id,
+                time.perf_counter() - whisper_start,
+                len(segments),
+            )
             if segments:
                 logger.info(f"Whisper successfully transcribed {len(segments)} segments for video {video_id}.")
                 self._write_cache(video_id, segments)
+                self._clear_failure_cache(video_id)
                 return segments
 
+        self._write_failure_cache(video_id, whisper_attempted=allow_whisper_fallback)
         logger.warning(f"Failed to obtain transcript for video {video_id}.")
         return []
 
@@ -146,6 +203,11 @@ class TranscriptExtractor:
             return []
 
     def _transcribe_with_whisper(self, video_id: str) -> List[Dict[str, Any]]:
+        # Whisper is memory-intensive; serialize it while caption retrieval stays concurrent.
+        with _WHISPER_TRANSCRIPTION_LOCK:
+            return self._transcribe_with_whisper_locked(video_id)
+
+    def _transcribe_with_whisper_locked(self, video_id: str) -> List[Dict[str, Any]]:
         """Download audio with yt-dlp and transcribe using Whisper."""
         try:
             import yt_dlp
@@ -171,6 +233,9 @@ class TranscriptExtractor:
             }],
             "quiet": True,
             "no_warnings": True,
+            "socket_timeout": 15,
+            "retries": 1,
+            "fragment_retries": 1,
             # Limit download to first 10 minutes to save processing time during retrieval
             "download_ranges": lambda info_dict, ydl: [{"start_time": 0, "end_time": 600}],
         }
@@ -241,7 +306,10 @@ class TranscriptExtractor:
         if cache_file.exists():
             try:
                 with open(cache_file, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    cached = json.load(f)
+                if isinstance(cached, list) and cached:
+                    return cached
+                logger.warning("Ignoring invalid or empty transcript cache for %s.", video_id)
             except Exception as e:
                 logger.warning(f"Failed to read transcript cache for {video_id}: {e}")
         return None
@@ -250,8 +318,75 @@ class TranscriptExtractor:
         if not self.enable_cache or not segments:
             return
         cache_file = self.cache_dir / f"{video_id}.json"
+        temp_file = None
         try:
-            with open(cache_file, "w", encoding="utf-8") as f:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.cache_dir,
+                delete=False,
+                suffix=".tmp",
+            ) as f:
+                temp_file = Path(f.name)
                 json.dump(segments, f, indent=2, ensure_ascii=False)
+            os.replace(temp_file, cache_file)
+            self._clear_failure_cache(video_id)
         except Exception as e:
             logger.warning(f"Failed to write transcript cache for {video_id}: {e}")
+        finally:
+            if temp_file and temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+
+    def _failure_cache_path(self, video_id: str) -> Path:
+        return self.cache_dir / f"{video_id}.failure.json"
+
+    def _read_failure_cache(self, video_id: str) -> Optional[Dict[str, Any]]:
+        if not self.enable_cache or self.failed_cache_ttl_seconds == 0:
+            return None
+        failure_file = self._failure_cache_path(video_id)
+        try:
+            with failure_file.open("r", encoding="utf-8") as cache:
+                entry = json.load(cache)
+            if float(entry.get("expires_at", 0)) > time.time():
+                return entry
+            failure_file.unlink(missing_ok=True)
+        except FileNotFoundError:
+            return None
+        except Exception as e:
+            logger.warning("Failed to read failed-transcript cache for %s: %s", video_id, e)
+            failure_file.unlink(missing_ok=True)
+        return None
+
+    def _write_failure_cache(self, video_id: str, whisper_attempted: bool) -> None:
+        if not self.enable_cache or self.failed_cache_ttl_seconds == 0:
+            return
+        failure_file = self._failure_cache_path(video_id)
+        temp_file = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                "w",
+                encoding="utf-8",
+                dir=self.cache_dir,
+                delete=False,
+                suffix=".tmp",
+            ) as cache:
+                temp_file = Path(cache.name)
+                json.dump(
+                    {
+                        "expires_at": time.time() + self.failed_cache_ttl_seconds,
+                        "whisper_attempted": whisper_attempted,
+                    },
+                    cache,
+                )
+            os.replace(temp_file, failure_file)
+        except Exception as e:
+            logger.warning("Failed to cache failed transcript lookup for %s: %s", video_id, e)
+        finally:
+            if temp_file and temp_file.exists():
+                temp_file.unlink(missing_ok=True)
+
+    def _clear_failure_cache(self, video_id: str) -> None:
+        try:
+            self._failure_cache_path(video_id).unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("Failed to clear failed-transcript cache for %s: %s", video_id, e)
